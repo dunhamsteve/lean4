@@ -23,14 +23,14 @@ def checkVerb (verb : String) : Handler := do
 def checkPathLiteral (p : String) : Handler := do
   let st ← get
   if p.isPrefixOf st.path then
-    set { st with path := st.path.extract p.bsize st.path.bsize }
+    set { st with path := st.path.extract p.endPos st.path.endPos }
   else
     throw $ IO.userError "invalid path"
 
 def getPathPart : HandlerM String := do
   let st ← get
   let stop := st.path.posOf '/'
-  set { st with path := st.path.extract stop st.path.bsize }
+  set { st with path := st.path.extract stop st.path.endPos }
   pure $ st.path.extract 0 stop
 
 def checkPathConsumed : Handler := do
@@ -48,11 +48,7 @@ def notFound : Handler := do
   modify fun st => { st with status := "404 Not Found" }
   write "whoops"
 
-def mkHandlersRef : IO (IO.Ref (List Handler)) :=
-  IO.mkRef ∅
-
-@[init mkHandlersRef]
-constant handlersRef : IO.Ref (List Handler)
+initialize handlersRef : IO.Ref (List Handler) <- IO.mkRef ∅
 
 def registerHandler (h : Handler) : IO Unit := do
   handlersRef.modify fun hs => h::hs
@@ -64,17 +60,17 @@ partial def parseHeaders (hIn : IO.FS.Stream) : IO Unit := do
 partial def run (hIn hOut : IO.FS.Stream) : IO Unit := do
   let line ← hIn.getLine
   if line != "" then
-    let [verb, path, proto] ← line.splitOn " "
+    let [verb, path, _proto] := line.splitOn " "
       | panic! "failed to parse request: " ++ line
     let stderr ← IO.getStderr
     stderr.putStrLn $ "=> " ++ verb ++ " " ++ path
-    let headers ← parseHeaders hIn
+    let _headers ← parseHeaders hIn
     let handlers ← handlersRef.get
     let (_, st) ← handlers.foldr (· <|> ·) notFound { verb, path }
     stderr.putStrLn $ "<= " ++ st.status
     hOut.putStrLn $ "HTTP/1.1 " ++ st.status
     hOut.putStrLn "Content-Type: text/html"
-    hOut.putStrLn $ "Content-Length: " ++ toString st.out.bsize
+    hOut.putStrLn $ "Content-Length: " ++ toString st.out.endPos
     st.outHeaders.forM hOut.putStrLn
     hOut.putStrLn ""
     hOut.putStr st.out
@@ -114,16 +110,16 @@ syntax element      : child
 syntax:max element : term
 
 macro_rules
-  | `(<$n/>) => quote ("<" ++ toString n.getId ++ "/>")
+  | `(<$n/>) => pure $ quote (k :=`term) ("<" ++ toString n.getId ++ "/>")
   | `(<$n>$cs*</$m>) => -- {{{
     if n.getId == m.getId then do
       let cs ← cs.mapM fun c => match c with
-        | `(child|$t:text)    => pure $ quote t[0].getAtomVal!
+        | `(child|$t:text)    => pure $ quote t.raw[0].getAtomVal
         | `(child|{$t})       => pure t
         | `(child|$e:element) => `($e:element)
         | _                   => unreachable!
       let cs := cs.push (quote ("</" ++ toString m.getId ++ ">"))
-      cs.foldlM (fun s e => `($s ++ $e)) (quote ("<" ++ toString n.getId ++ ">"))
+      cs.foldlM (β := TSyntax `term) (fun s e => `($s ++ $e)) (quote ("<" ++ toString n.getId ++ ">"))
     else Macro.throwError ("expected </" ++ toString n.getId ++ ">")
 -- }}}
 -- }}}
@@ -152,15 +148,15 @@ syntax "GET" : verb
 syntax "POST" : verb
 
 macro v:verb p:path " => " t:term : command => do -- {{{
-  let `(path| $[$pis:pathItem]* ) ← p
+  let `(path| $[$pis:pathItem]* ) := p
     | unreachable!
   let t ← `(do checkPathConsumed; $t:term)
   let t ← pis.foldrM (fun pi t => match pi with
-    | `(pathItem|$l:pathLiteral) => `(do checkPathLiteral $(quote l[0].getAtomVal!); $t:term)
+    | `(pathItem|$l:pathLiteral) => `(do checkPathLiteral $(quote l.raw[0].getAtomVal); $t:term)
     | `(pathItem|{$id}) => `(do let $id:ident ← getPathPart; $t:term)
     | _ => Macro.throwError s!"unknown pathItem '{Syntax.formatStx pi}'") t
   `(def handler : Handler := do
-      checkVerb $(quote v[0].getAtomVal!)
+      checkVerb $(quote v.raw[0].getAtomVal)
       $t:term
 
     @[init] def reg : IO Unit := registerHandler handler)
